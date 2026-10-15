@@ -13,6 +13,7 @@ class Screenshot:
     data: bytes
     format: str  # "jpg" | "jxr" | "png"
     path: str
+    backend: str = "unknown"
 
     def to_png(self, max_width: int = 1280) -> bytes:
         """Decode this screenshot and return PNG bytes, downscaled to max_width."""

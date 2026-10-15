@@ -11,6 +11,8 @@ from typing import Any
 
 from .client import JokerClient, JokerError
 from .buttons import format_mask, parse_buttons
+from .admin import AdminManager
+from .toolkit import AppProject, ProfileManager, ProjectAdapter
 
 
 def _translate_seq_step(step: str, default_ms: int) -> str:
@@ -34,6 +36,7 @@ def _print_json(data: Any) -> None:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="jokerps5")
     parser.add_argument("--host", default=None, help="PS5 host/IP (default: $PS5_HOST)")
+    parser.add_argument("--port", type=int, default=None, help="jokerd port (default: $PS5_PORT or 9310)")
     parser.add_argument("--json", action="store_true", help="print raw JSON for data commands")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -57,6 +60,11 @@ def _build_parser() -> argparse.ArgumentParser:
     shot = sub.add_parser("shot")
     shot.add_argument("-o", "--output", default=None)
     shot.add_argument("--max-width", type=int, default=1280)
+    shot.add_argument("--raw", action="store_true", help="save the console image unchanged; useful for JXR/HDR")
+    shot.add_argument("--backend", choices=("create", "latest", "grab"), default="create")
+    shot.add_argument("--request", default=None, help="grab request path in the running title folder")
+    shot.add_argument("--folder", default=None, help="grab output folder watched by jokerd")
+    shot.add_argument("--wait-ms", type=int, default=3000)
 
     sub.add_parser("apps")
 
@@ -86,6 +94,66 @@ def _build_parser() -> argparse.ArgumentParser:
     notify.add_argument("text", nargs="+")
 
     sub.add_parser("info")
+
+    backup = sub.add_parser("backup", help="create a verified local backup of remote paths")
+    backup.add_argument("destination")
+    backup.add_argument("paths", nargs="+")
+
+    restore = sub.add_parser("restore", help="restore a Joker backup and verify every file")
+    restore.add_argument("source")
+
+    edit = sub.add_parser("edit-text", help="replace text once with a remote rollback copy")
+    edit.add_argument("remote")
+    edit.add_argument("old")
+    edit.add_argument("new")
+
+    deploy = sub.add_parser("deploy-homebrew", help="upload and verify a homebrew application")
+    deploy.add_argument("local_dir")
+    deploy.add_argument("title_id")
+    deploy.add_argument("--shadowmount-url", default=None)
+
+    create_app = sub.add_parser("create-app", help="create a validated native homebrew folder")
+    create_app.add_argument("destination")
+    create_app.add_argument("title_id")
+    create_app.add_argument("name")
+    create_app.add_argument("executable")
+    create_app.add_argument("--icon", default=None)
+    create_app.add_argument("--version", default="01.000.000")
+    create_app.add_argument("--category", choices=("game", "media"), default="game")
+
+    validate_app = sub.add_parser("validate-app", help="validate app metadata, art, and hashes")
+    validate_app.add_argument("directory")
+
+    apply_profile = sub.add_parser("apply-profile", help="apply a rollback-safe JSON configuration profile")
+    apply_profile.add_argument("profile")
+
+    project_create = sub.add_parser("project-create", help="create a native or Vulkan PS5 project from upstream tooling")
+    project_create.add_argument("kind", choices=("native", "vulkan"))
+    project_create.add_argument("destination")
+    project_create.add_argument("title_id")
+    project_create.add_argument("name")
+    project_create.add_argument("--template", default=None, help="local template checkout or alternate Git URL")
+
+    project_inspect = sub.add_parser("project-inspect", help="inspect Joker project identity and build commands")
+    project_inspect.add_argument("directory")
+
+    project_doctor = sub.add_parser("project-doctor", help="run the upstream project environment doctor/bootstrap")
+    project_doctor.add_argument("directory")
+
+    project_build = sub.add_parser("project-build", help="run the upstream project build")
+    project_build.add_argument("directory")
+
+    project_deploy = sub.add_parser("project-deploy", help="locate, upload, verify, and register a built project")
+    project_deploy.add_argument("directory")
+    project_deploy.add_argument("--shadowmount-url", default=None)
+
+    dashboard = sub.add_parser("dashboard", help="run the local web control dashboard")
+    dashboard.add_argument("--bind", default="127.0.0.1")
+    dashboard.add_argument("--listen", type=int, default=8745)
+    dashboard.add_argument("--token", default=None, help="required bearer token for non-localhost binding")
+
+    sub.add_parser("health", help="collect a read-only console health snapshot")
+    sub.add_parser("audit", help="audit thermals, storage, apps, and controller readiness")
     sub.add_parser("quit")
 
     return parser
@@ -102,8 +170,11 @@ def _put_recursive(client: JokerClient, local: Path, remote: str) -> None:
     print(f"put {local} -> {remote} ({len(data)} bytes)")
 
 
-def _run(args: argparse.Namespace, client: JokerClient) -> int:
+def _run(args: argparse.Namespace, client: JokerClient | None) -> int:
     cmd = args.command
+    local_commands = {"create-app", "validate-app", "project-create", "project-inspect", "project-doctor", "project-build"}
+    if cmd not in local_commands and client is None:
+        raise ValueError("this command requires --host or PS5_HOST")
     if cmd == "hello":
         result = client.hello()
         _print_json(result) if args.json else print(result)
@@ -128,11 +199,18 @@ def _run(args: argparse.Namespace, client: JokerClient) -> int:
         result = client.pad_seq(wire_steps)
         _print_json(result) if args.json else print(result)
     elif cmd == "shot":
-        screenshot = client.shot()
-        png = screenshot.to_png(max_width=args.max_width)
-        out_path = args.output or f"screenshot.png"
-        Path(out_path).write_bytes(png)
-        print(out_path)
+        if args.backend == "latest":
+            screenshot = client.shot_latest()
+        elif args.backend == "grab":
+            if not args.request or not args.folder:
+                raise ValueError("--backend grab requires --request and --folder")
+            screenshot = client.shot_grab(args.request, args.folder, args.wait_ms)
+        else:
+            screenshot = client.shot()
+        image = screenshot.data if args.raw else screenshot.to_png(max_width=args.max_width)
+        out_path = args.output or f"screenshot.{screenshot.format if args.raw else 'png'}"
+        Path(out_path).write_bytes(image)
+        print(f"{out_path} ({screenshot.backend})")
     elif cmd == "apps":
         result = client.app_list()
         _print_json(result) if args.json else print(result)
@@ -167,6 +245,66 @@ def _run(args: argparse.Namespace, client: JokerClient) -> int:
     elif cmd == "info":
         result = client.sys_info()
         _print_json(result) if args.json else print(result)
+    elif cmd == "backup":
+        result = AdminManager(client).backup(args.paths, Path(args.destination))
+        _print_json(result) if args.json else print(f"backed up {len(result['files'])} files")
+    elif cmd == "restore":
+        result = AdminManager(client).restore(Path(args.source))
+        _print_json(result) if args.json else print(f"restored {result['restored']} files")
+    elif cmd == "edit-text":
+        result = AdminManager(client).edit_text(args.remote, args.old, args.new)
+        _print_json(result) if args.json else print(f"updated; rollback copy: {result['backup']}")
+    elif cmd == "deploy-homebrew":
+        result = AdminManager(client).deploy_homebrew(
+            Path(args.local_dir), args.title_id, shadowmount_url=args.shadowmount_url
+        )
+        _print_json(result) if args.json else print(
+            f"deployed {result['files']} files ({result['bytes']} bytes) to {result['remote_root']}"
+        )
+    elif cmd == "create-app":
+        result = AppProject.create(
+            Path(args.destination), args.title_id, args.name, Path(args.executable),
+            icon=Path(args.icon) if args.icon else None, version=args.version, category=args.category,
+        )
+        _print_json(result) if args.json else print(f"created {result['root']} ({len(result['files'])} files)")
+    elif cmd == "validate-app":
+        result = AppProject.validate(Path(args.directory))
+        _print_json(result) if args.json else print(result)
+        if not result["ok"]:
+            return 2
+    elif cmd == "apply-profile":
+        result = ProfileManager(client).apply(Path(args.profile))
+        _print_json(result) if args.json else print(f"applied {result['name']} ({len(result['changed'])} files)")
+    elif cmd == "project-create":
+        result = ProjectAdapter.create(args.kind, Path(args.destination), args.title_id, args.name, template=args.template)
+        _print_json(result) if args.json else print(f"created {result['kind']} project at {result['root']}")
+    elif cmd == "project-inspect":
+        result = ProjectAdapter.inspect(Path(args.directory))
+        _print_json(result) if args.json else print(result)
+    elif cmd == "project-doctor":
+        result = ProjectAdapter.run_action(Path(args.directory), "doctor")
+        _print_json(result) if args.json else print("project doctor passed")
+    elif cmd == "project-build":
+        result = ProjectAdapter.run_action(Path(args.directory), "build")
+        _print_json(result) if args.json else print("project build passed")
+    elif cmd == "project-deploy":
+        directory = Path(args.directory)
+        project = ProjectAdapter.inspect(directory)
+        app = ProjectAdapter.find_app(directory)
+        result = AdminManager(client).deploy_homebrew(
+            app, project["title_id"], shadowmount_url=args.shadowmount_url
+        )
+        _print_json(result) if args.json else print(f"deployed {project['title_id']} from {app}")
+    elif cmd == "dashboard":
+        from .dashboard import serve
+
+        serve(client.host, client.port, bind=args.bind, listen=args.listen, token=args.token)
+    elif cmd == "health":
+        result = AdminManager(client).health()
+        _print_json(result) if args.json else print(result)
+    elif cmd == "audit":
+        result = AdminManager(client).audit()
+        _print_json(result) if args.json else print(result)
     elif cmd == "quit":
         client.quit()
         print("quit")
@@ -176,13 +314,15 @@ def _run(args: argparse.Namespace, client: JokerClient) -> int:
 def main() -> None:
     parser = _build_parser()
     args = parser.parse_args()
-    client = JokerClient(host=args.host)
+    port = args.port if args.port is not None else int(os.environ.get("PS5_PORT", "9310"))
+    local_commands = {"create-app", "validate-app", "project-create", "project-inspect", "project-doctor", "project-build"}
+    client = None if args.command in local_commands else JokerClient(host=args.host, port=port)
     try:
         sys.exit(_run(args, client))
     except JokerError as exc:
         print(f"error: {exc}", file=sys.stderr)
         sys.exit(1)
-    except ValueError as exc:
+    except (ValueError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         sys.exit(1)
 

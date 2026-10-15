@@ -49,6 +49,16 @@ def test_shot_roundtrip(client):
     assert png[:8] == b"\x89PNG\r\n\x1a\n"
 
 
+def test_shot_backends(client):
+    assert client.shot_latest().backend == "gallery"
+    assert client.shot_grab("/data/app/request", "/data/app/shots").backend == "title-grab"
+
+
+def test_shot_grab_validates_timeout(client):
+    with pytest.raises(ValueError, match="100..30000"):
+        client.shot_grab("/data/app/request", "/data/app/shots", wait_ms=50)
+
+
 def test_fs_put_get_roundtrip(client):
     client.fs_put("/data/test.txt", b"hello world")
     data = client.fs_get("/data/test.txt")

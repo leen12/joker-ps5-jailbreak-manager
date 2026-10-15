@@ -29,6 +29,7 @@ class FakeJokerServer:
         self._thread = threading.Thread(target=self._serve, daemon=True)
         self.drop_next_connection = False
         self.fs_files: dict[str, bytes] = {}
+        self.fs_modes: dict[str, int] = {}
         self._thread.start()
 
     def stop(self) -> None:
@@ -82,13 +83,38 @@ class FakeJokerServer:
             self._reply(conn, {"ok": True, "steps": []})
         elif cmd == "shot":
             png = make_tiny_png()
-            self._reply(conn, {"ok": True, "bytes": len(png), "path": "/data/shot.png", "format": "png", "deleted": "0x1"})
+            backend = "gallery" if len(parts) > 1 and parts[1] == "latest" else "title-grab" if len(parts) > 1 and parts[1] == "grab" else "create"
+            self._reply(conn, {"ok": True, "bytes": len(png), "path": "/data/shot.png", "format": "png", "backend": backend, "deleted": "0x1"})
             conn.sendall(png)
         elif cmd == "fs" and parts[1] == "get":
             path = parts[2]
             data = self.fs_files.get(path, b"")
             self._reply(conn, {"ok": True, "bytes": len(data)})
             conn.sendall(data)
+        elif cmd == "fs" and parts[1] == "stat":
+            path = parts[2]
+            if path in self.fs_files:
+                self._reply(conn, {"ok": True, "type": "f", "size": len(self.fs_files[path]), "mtime": 1, "mode": f"{self.fs_modes.get(path, 0o644):o}"})
+            else:
+                prefix = path.rstrip("/") + "/"
+                if any(item.startswith(prefix) for item in self.fs_files):
+                    self._reply(conn, {"ok": True, "type": "d", "size": 0, "mtime": 1, "mode": "755"})
+                else:
+                    self._reply(conn, {"ok": False, "error": "not found"})
+        elif cmd == "fs" and parts[1] == "ls":
+            path = parts[2].rstrip("/")
+            prefix = path + "/"
+            entries: dict[str, str] = {}
+            for item in self.fs_files:
+                if not item.startswith(prefix):
+                    continue
+                tail = item[len(prefix):]
+                name, sep, _ = tail.partition("/")
+                entries[name] = "d" if sep else "f"
+            self._reply(conn, {"ok": True, "entries": [
+                {"name": name, "type": kind, "size": len(self.fs_files.get(prefix + name, b"")), "mtime": 1}
+                for name, kind in sorted(entries.items())
+            ]})
         elif cmd == "fs" and parts[1] == "put":
             path = parts[2]
             size = int(parts[3])
@@ -96,8 +122,18 @@ class FakeJokerServer:
                 rest += conn.recv(65536)
             data, rest = rest[:size], rest[size:]
             self.fs_files[path] = data
+            self.fs_modes[path] = int(parts[4], 8) if len(parts) > 4 else 0o644
             self._reply(conn, {"ok": True, "written": size})
             return rest
+        elif cmd == "fs" and parts[1] == "mkdir":
+            self._reply(conn, {"ok": True})
+        elif cmd == "fs" and parts[1] == "rm":
+            path = parts[2]
+            prefix = path.rstrip("/") + "/"
+            for item in [item for item in self.fs_files if item == path or item.startswith(prefix)]:
+                self.fs_files.pop(item, None)
+                self.fs_modes.pop(item, None)
+            self._reply(conn, {"ok": True})
         elif cmd == "fail":
             self._reply(conn, {"ok": False, "error": "boom"})
         else:

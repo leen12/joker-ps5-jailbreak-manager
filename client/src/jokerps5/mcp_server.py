@@ -10,6 +10,8 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.utilities.types import Image
 
 from .client import JokerClient
+from .admin import AdminManager
+from .toolkit import AppProject, ProfileManager, ProjectAdapter
 
 mcp = FastMCP("joker-ps5")
 
@@ -18,7 +20,7 @@ def _client() -> JokerClient:
     host = os.environ.get("PS5_HOST")
     if not host:
         raise RuntimeError("PS5_HOST environment variable is not set; point it at the console's IP")
-    return JokerClient(host=host)
+    return JokerClient(host=host, port=int(os.environ.get("PS5_PORT", "9310")))
 
 
 @mcp.tool()
@@ -106,20 +108,44 @@ def sequence(steps: list[str], screenshot_after_ms: int | None = None) -> Any:
     return result
 
 
-def _screenshot_image(client: JokerClient, max_width: int = 1280) -> Image:
-    shot = client.shot()
+def _screenshot_image(
+    client: JokerClient,
+    max_width: int = 1280,
+    backend: str = "create",
+    request_path: str | None = None,
+    folder: str | None = None,
+    wait_ms: int = 3000,
+) -> Image:
+    if backend == "latest":
+        shot = client.shot_latest()
+    elif backend == "grab":
+        if not request_path or not folder:
+            raise ValueError("grab backend requires request_path and folder")
+        shot = client.shot_grab(request_path, folder, wait_ms)
+    elif backend == "create":
+        shot = client.shot()
+    else:
+        raise ValueError("backend must be create, latest, or grab")
     png = shot.to_png(max_width=max_width)
     return Image(data=png, format="png")
 
 
 @mcp.tool()
-def screenshot(max_width: int = 1280) -> Image:
+def screenshot(
+    max_width: int = 1280,
+    backend: str = "create",
+    request_path: str | None = None,
+    folder: str | None = None,
+    wait_ms: int = 3000,
+) -> Image:
     """Capture a screenshot of the console's current screen.
 
-    Takes about 3 seconds (holds Create to trigger capture) and requires the
-    virtual controller to be open first. Returns a downscaled PNG.
+    backend=create takes a new whole-screen capture using the Create shortcut.
+    backend=latest downloads the newest existing gallery image without deletion.
+    backend=grab asks a cooperating title for its next frame and requires its
+    request_path and output folder. Returns a downscaled PNG.
     """
-    return _screenshot_image(_client(), max_width=max_width)
+    return _screenshot_image(_client(), max_width, backend, request_path, folder, wait_ms)
 
 
 @mcp.tool()
@@ -194,6 +220,115 @@ def notify(text: str) -> dict[str, Any]:
     """Show a PS5 system notification with the given text."""
     _client().notify(text)
     return {"ok": True}
+
+
+@mcp.tool()
+def console_health() -> dict[str, Any]:
+    """Collect a read-only health snapshot: firmware, temperatures, disk, pad, and running app."""
+    return AdminManager(_client()).health()
+
+
+@mcp.tool()
+def audit_console() -> dict[str, Any]:
+    """Audit console thermals, free-space ratios, duplicate app identities, and controller readiness."""
+    return AdminManager(_client()).audit()
+
+
+@mcp.tool()
+def backup_console(remote_paths: list[str], local_directory: str) -> dict[str, Any]:
+    """Create a local, hash-manifested backup of console files or directories."""
+    from pathlib import Path
+
+    return AdminManager(_client()).backup(remote_paths, Path(local_directory))
+
+
+@mcp.tool()
+def restore_console(local_directory: str) -> dict[str, Any]:
+    """Restore and verify a backup created by backup_console."""
+    from pathlib import Path
+
+    return AdminManager(_client()).restore(Path(local_directory))
+
+
+@mcp.tool()
+def edit_console_text(remote_path: str, old: str, new: str) -> dict[str, Any]:
+    """Replace one exact text occurrence, saving a timestamped rollback copy first."""
+    return AdminManager(_client()).edit_text(remote_path, old, new)
+
+
+@mcp.tool()
+def deploy_homebrew(local_directory: str, title_id: str, shadowmount_url: str | None = None) -> dict[str, Any]:
+    """Upload and hash-verify a homebrew app, then optionally register and scan it with ShadowMount."""
+    from pathlib import Path
+
+    return AdminManager(_client()).deploy_homebrew(
+        Path(local_directory), title_id, shadowmount_url=shadowmount_url
+    )
+
+
+@mcp.tool()
+def create_homebrew_project(
+    destination: str,
+    title_id: str,
+    name: str,
+    executable: str,
+    icon: str | None = None,
+    version: str = "01.000.000",
+    category: str = "game",
+) -> dict[str, Any]:
+    """Create a complete, validated ShadowMount-compatible app folder with metadata and artwork."""
+    from pathlib import Path
+
+    return AppProject.create(
+        Path(destination), title_id, name, Path(executable),
+        icon=Path(icon) if icon else None, version=version, category=category,
+    )
+
+
+@mcp.tool()
+def validate_homebrew_project(directory: str) -> dict[str, Any]:
+    """Validate app identity, executable layout, icon dimensions, metadata, and file hashes."""
+    from pathlib import Path
+
+    return AppProject.validate(Path(directory))
+
+
+@mcp.tool()
+def apply_console_profile(profile: str) -> dict[str, Any]:
+    """Apply exact configuration replacements as one verified, rollback-safe transaction."""
+    from pathlib import Path
+
+    return ProfileManager(_client()).apply(Path(profile))
+
+
+@mcp.tool()
+def create_ps5_project(
+    kind: str,
+    destination: str,
+    title_id: str,
+    name: str,
+    template: str | None = None,
+) -> dict[str, Any]:
+    """Create a native or Vulkan project using its upstream generator and add Joker capture integration."""
+    from pathlib import Path
+
+    return ProjectAdapter.create(kind, Path(destination), title_id, name, template=template)
+
+
+@mcp.tool()
+def inspect_ps5_project(directory: str) -> dict[str, Any]:
+    """Inspect a Joker project identity, manifests, capture paths, and upstream commands."""
+    from pathlib import Path
+
+    return ProjectAdapter.inspect(Path(directory))
+
+
+@mcp.tool()
+def build_ps5_project(directory: str) -> dict[str, Any]:
+    """Run the upstream build command recorded for a Joker-managed project."""
+    from pathlib import Path
+
+    return ProjectAdapter.run_action(Path(directory), "build")
 
 
 def main() -> None:

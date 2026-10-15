@@ -19,7 +19,7 @@ The payload `jokerd.elf` runs on the console and listens on **TCP 9310**.
 | Command | Reply fields | Notes |
 |---|---|---|
 | `hello` | `name`, `version`, `proto` (=1), `fw` (hex string), `pid`, `pad` (`"open"`/`"closed"`) | Use first to check the payload is alive |
-| `pad open [user_id]` | `backend` (`"hid"` or `"vdev"`), `handle`, `user`, `steps` (array of strings) | `user_id` defaults to the foreground user. `steps` records every call and its return code |
+| `pad open [user_id]` | `backend` (`"libScePad"` or `"direct-hid"`), `handle`, `user`, `steps` (array of strings) | `user_id` defaults to the foreground user. If libSceMbus cannot load, Joker falls back to the direct `/dev/hid` ioctl ABI. `steps` records every call and its return code |
 | `pad close` | `steps` | Removes the device. Always call before stopping the payload |
 | `pad status` | `open`, `backend`, `handle`, `user`, `inserts`, `last` (hex) | |
 | `pad set <buttons> <lx> <ly> <rx> <ry> <l2> <r2>` | — | Hold this state until changed. Axes 0..255, 128 = centre |
@@ -27,6 +27,8 @@ The payload `jokerd.elf` runs on the console and listens on **TCP 9310**.
 | `pad seq <step> <step> ...` | `steps_run` | Steps: `<buttons>:<ms>` press, `w<ms>` wait. Max 64 steps |
 | `pad release` | — | Neutral state |
 | `shot [hold_ms]` | `bytes`, `path`, `format` (`"jpg"`/`"jxr"`/`"png"`), `deleted` (hex) | Holds Create (default 1200 ms), waits up to 10 s for the new capture, sends it, deletes it from the console |
+| `shot latest` | `bytes`, `path`, `format`, `backend` (`"gallery"`) | Sends the newest existing gallery capture without deleting it |
+| `shot grab <request> <folder> [wait_ms]` | `bytes`, `path`, `format`, `backend` (`"title-grab"`) | Creates a request marker for a cooperating title, waits for a stable new image, sends it, and removes the temporary image |
 | `shots` | `files` (array of `{path,size,mtime}`) | Newest 5 captures |
 | `app list` | `apps` (array of `{id, name}`) | From `/user/app` and `/user/appmeta/<id>/param.json` |
 | `app launch <title_id>` | `app_id` | |
@@ -67,3 +69,7 @@ When `l2`/`r2` bits are set and their analog value is 0, the payload sends 255.
 - `fs put` and `fs rm` refuse paths outside `/data`, `/user/data`, `/mnt/ext1`, `/mnt/usb*`, `/user/av_contents`, `/user/app`, `/user/homebrew`.
 - One client at a time runs a command. Others wait (queued by the accept loop).
 - When a client disconnects while buttons are held, the payload releases to neutral.
+- Higher-level administration in the Python client creates SHA-256 manifests, stages writes through
+  the payload's `.part` + rename flow, and verifies uploaded bytes by reading them back.
+- Text edits create a timestamped sibling backup before replacement. Restore validates local hashes
+  before writing and verifies each remote file afterward.

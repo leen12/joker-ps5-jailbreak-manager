@@ -185,7 +185,23 @@ class JokerClient:
         reply, data = self.request(f"shot {hold_ms}")
         if data is None:
             raise JokerError("shot reply did not include raw bytes", reply)
-        return Screenshot(data=data, format=reply["format"], path=reply["path"])
+        return Screenshot(data=data, format=reply["format"], path=reply["path"], backend=reply.get("backend", "create"))
+
+    def shot_latest(self) -> Screenshot:
+        """Download the newest existing gallery capture without deleting it."""
+        reply, data = self.request("shot latest")
+        if data is None:
+            raise JokerError("latest shot reply did not include raw bytes", reply)
+        return Screenshot(data=data, format=reply["format"], path=reply["path"], backend=reply.get("backend", "gallery"))
+
+    def shot_grab(self, request_path: str, folder: str, wait_ms: int = 3000) -> Screenshot:
+        """Request and download the next frame produced by a cooperating title."""
+        if not 100 <= wait_ms <= 30000:
+            raise ValueError("wait_ms must be in 100..30000")
+        reply, data = self.request(f"shot grab {_quote_path(request_path)} {_quote_path(folder)} {wait_ms}")
+        if data is None:
+            raise JokerError("grab reply did not include raw bytes", reply)
+        return Screenshot(data=data, format=reply["format"], path=reply["path"], backend=reply.get("backend", "title-grab"))
 
     def shots(self) -> list[dict[str, Any]]:
         reply, _ = self.request("shots")

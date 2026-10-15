@@ -50,6 +50,24 @@
 #define SHOT_WAIT_MS    10000
 #define KLOG_PORT       3232
 #define NEWEST_SHOTS    5
+#define HID_ADD_DEVICE  0xC018482AUL
+#define HID_INSERT_DATA 0x8018482CUL
+#define HID_DEL_DEVICE  0x80104850UL
+#define HID_REPORT_SIZE 0xA0
+
+typedef struct hid_req {
+    uint32_t cmd;
+    uint32_t reserved;
+    void *data;
+    void *out;
+} hid_req_t;
+
+typedef struct hid_del {
+    uint8_t cmd;
+    uint8_t pad[7];
+    uint32_t handle;
+    uint32_t pad2;
+} hid_del_t;
 
 /* ── Pad data (120-byte sample) ──────────────────────────────────────── */
 
@@ -127,6 +145,8 @@ typedef struct launch_param {
 static struct {
     pthread_mutex_t lock;
     bool libs_ready;
+    bool direct_hid;
+    int hid_fd;
     bool open;
     int32_t handle;
     uint64_t device_id;
@@ -134,7 +154,7 @@ static struct {
     int32_t last_insert;
     uint32_t inserts;
     pad_data_t state;
-} g_pad = {.lock = PTHREAD_MUTEX_INITIALIZER, .handle = -1, .user_id = -1};
+} g_pad = {.lock = PTHREAD_MUTEX_INITIALIZER, .hid_fd = -1, .handle = -1, .user_id = -1};
 
 static bool g_launcher_ready;
 static bool g_delete_ready;
@@ -157,9 +177,53 @@ static void pad_neutral(pad_data_t *d) {
 }
 
 static int32_t pad_insert(int32_t handle, const pad_data_t *d) {
+    if (g_pad.direct_hid) {
+        uint8_t report[HID_REPORT_SIZE] = {0};
+        memcpy(report + 0x0c, &d->buttons, sizeof(d->buttons));
+        report[0x10] = d->lx;
+        report[0x11] = d->ly;
+        report[0x12] = d->rx;
+        report[0x13] = d->ry;
+        report[0x14] = d->l2;
+        report[0x15] = d->r2;
+        report[0x17] = 1;
+        memcpy(report + 0x78 + 12, &d->orientation[3], sizeof(float));
+        hid_req_t req = {.cmd = (uint32_t)handle, .data = report, .out = NULL};
+        return ioctl(g_pad.hid_fd, HID_INSERT_DATA, &req);
+    }
     pad_data_t stamped = *d;
     stamped.timestamp = monotonic_us();
     return scePadVirtualDeviceInsertData(handle, &stamped);
+}
+
+static int pad_direct_open(int32_t user_id, char *steps, size_t ssize) {
+    int fd = open("/dev/hid", O_RDWR);
+    if (fd < 0) {
+        step(steps, ssize, "hid-open=%d", errno);
+        return -1;
+    }
+    uint8_t descriptor[168] = {0};
+    descriptor[0] = 3;
+    memcpy(descriptor + 0x1c, &user_id, sizeof(user_id));
+    descriptor[0x20] = 1;
+    int32_t handle = -1;
+    hid_req_t req = {.cmd = 3, .data = descriptor, .out = &handle};
+    int rc = ioctl(fd, HID_ADD_DEVICE, &req);
+    step(steps, ssize, "hid-add=%d handle=%d", rc, handle);
+    if (rc != 0 || handle < 0) {
+        close(fd);
+        return -1;
+    }
+    pthread_mutex_lock(&g_pad.lock);
+    pad_neutral(&g_pad.state);
+    g_pad.direct_hid = true;
+    g_pad.hid_fd = fd;
+    g_pad.handle = handle;
+    g_pad.user_id = user_id;
+    g_pad.inserts = 0;
+    g_pad.open = true;
+    pthread_mutex_unlock(&g_pad.lock);
+    return 0;
 }
 
 /* ── Insert thread: keeps the held state arriving ────────────────────── */
@@ -261,7 +325,11 @@ static int pad_libraries(char *steps, size_t ssize) {
 
     void *mbus = dlopen("/system/common/lib/libSceMbus.sprx", RTLD_NOW | RTLD_GLOBAL);
     if (!mbus) mbus = dlopen("libSceMbus.sprx", RTLD_NOW | RTLD_GLOBAL);
-    if (!mbus) { step(steps, ssize, "mbus=not-loaded"); return -1; }
+    if (!mbus) {
+        const char *error = dlerror();
+        step(steps, ssize, "mbus=not-loaded:%s", error ? error : "unknown");
+        return -1;
+    }
     mbus_bind = (int32_t (*)(uint64_t, int32_t))dlsym(mbus, "sceMbusBindDeviceWithUserId");
     step(steps, ssize, "mbus_bind=%s", mbus_bind ? "found" : "missing");
 
@@ -300,10 +368,13 @@ static int32_t pad_find_handle(int32_t added, const add_device_param_t *p,
 
 static int cmd_pad_open(int32_t user_id, char *steps, size_t ssize) {
     if (g_pad.open) { step(steps, ssize, "already-open"); return 0; }
-    if (pad_libraries(steps, ssize)) return -1;
     if (user_id <= UNASSIGNED_USER)
         sceUserServiceGetForegroundUser(&user_id);
     step(steps, ssize, "user=0x%08x", (uint32_t)user_id);
+    if (pad_libraries(steps, ssize)) {
+        step(steps, ssize, "backend=direct-hid");
+        return pad_direct_open(user_id, steps, ssize);
+    }
 
     int log = klog_open();
     if (log < 0) step(steps, ssize, "klog=unavailable");
@@ -330,6 +401,7 @@ static int cmd_pad_open(int32_t user_id, char *steps, size_t ssize) {
 
     pthread_mutex_lock(&g_pad.lock);
     pad_neutral(&g_pad.state);
+    g_pad.direct_hid = false;
     g_pad.handle = handle;
     g_pad.device_id = devid;
     g_pad.user_id = user_id;
@@ -343,14 +415,25 @@ static void cmd_pad_close(char *steps, size_t ssize) {
     pthread_mutex_lock(&g_pad.lock);
     bool was = g_pad.open;
     int32_t h = g_pad.handle;
+    bool direct = g_pad.direct_hid;
+    int hid_fd = g_pad.hid_fd;
     g_pad.open = false;
+    g_pad.direct_hid = false;
+    g_pad.hid_fd = -1;
     g_pad.handle = -1;
     pthread_mutex_unlock(&g_pad.lock);
     if (!was) { step(steps, ssize, "not-open"); return; }
-    pad_data_t neutral;
-    pad_neutral(&neutral);
-    pad_insert(h, &neutral);
-    step(steps, ssize, "delete=0x%08x", (uint32_t)scePadVirtualDeviceDeleteDevice(h));
+    if (direct) {
+        hid_del_t del = {.cmd = 5, .handle = (uint32_t)h};
+        int rc = ioctl(hid_fd, HID_DEL_DEVICE, &del);
+        close(hid_fd);
+        step(steps, ssize, "hid-delete=%d", rc);
+    } else {
+        pad_data_t neutral;
+        pad_neutral(&neutral);
+        pad_insert(h, &neutral);
+        step(steps, ssize, "delete=0x%08x", (uint32_t)scePadVirtualDeviceDeleteDevice(h));
+    }
 }
 
 /* ── Launcher ────────────────────────────────────────────────────────── */
@@ -502,6 +585,71 @@ static int cmd_shot(int fd, int hold_ms) {
     }
     close(ffd);
     return 0;
+}
+
+static int send_capture(int fd, const capture_t *capture, const char *backend, int remove_after) {
+    int file = open(capture->path, O_RDONLY);
+    if (file < 0) return reply_error(fd, "open: %s", strerror(errno));
+    jbuf_t j;
+    jb_begin(&j, 1);
+    jb_int(&j, "bytes", (long long)capture->size);
+    jb_str(&j, "path", capture->path);
+    jb_str(&j, "format", format_from_ext(capture->path));
+    jb_str(&j, "backend", backend);
+    if (reply_json(fd, &j)) { close(file); return -1; }
+    char buffer[8192];
+    off_t remaining = capture->size;
+    int failed = 0;
+    while (remaining > 0) {
+        size_t want = remaining < (off_t)sizeof(buffer) ? (size_t)remaining : sizeof(buffer);
+        ssize_t got = read(file, buffer, want);
+        if (got <= 0 || send_all(fd, buffer, (size_t)got)) { failed = 1; break; }
+        remaining -= got;
+    }
+    close(file);
+    if (!failed && remove_after) unlink(capture->path);
+    return failed ? -1 : 0;
+}
+
+static int cmd_shot_latest(int fd) {
+    capture_t captures[NEWEST_SHOTS];
+    int count = 0;
+    if (find_newest(captures, &count)) return reply_error(fd, "no captures found");
+    return send_capture(fd, &captures[0], "gallery", 0);
+}
+
+static int cmd_shot_grab(int fd, const char *request, const char *folder, int wait_ms) {
+    if (!path_is_clean(request) || !path_is_clean(folder) ||
+        !path_is_writable_area(request) || !path_is_writable_area(folder))
+        return reply_error(fd, "grab paths must be writable absolute paths");
+    capture_t before[NEWEST_SHOTS] = {0};
+    int before_count = 0;
+    captures_walk(folder, 0, before, &before_count);
+    int marker = open(request, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (marker < 0) return reply_error(fd, "request create: %s", strerror(errno));
+    close(marker);
+    chmod(request, 0666);
+
+    uint64_t deadline = now_ms() + (uint64_t)wait_ms;
+    off_t observed_size = -1;
+    while (now_ms() < deadline) {
+        sleep_ms(25);
+        capture_t after[NEWEST_SHOTS] = {0};
+        int after_count = 0;
+        captures_walk(folder, 0, after, &after_count);
+        if (after_count == 0) continue;
+        int changed = before_count == 0 || strcmp(after[0].path, before[0].path) ||
+                      after[0].mtime > before[0].mtime || after[0].size != before[0].size;
+        if (!changed) continue;
+        if (after[0].size > 0 && after[0].size == observed_size) {
+            unlink(request);
+            return send_capture(fd, &after[0], "title-grab", 1);
+        }
+        observed_size = after[0].size;
+    }
+    int marker_still_present = unlink(request) == 0;
+    return reply_error(fd, "no title frame within %d ms; request was %s", wait_ms,
+                       marker_still_present ? "not consumed" : "consumed");
 }
 
 /* ── Filesystem commands ─────────────────────────────────────────────── */
@@ -806,7 +954,7 @@ static int handle_command(int fd, char *line) {
             jbuf_t j;
             jb_begin(&j, rc == 0);
             if (rc) jb_str(&j, "error", "pad open failed");
-            jb_str(&j, "backend", "hid");
+            jb_str(&j, "backend", g_pad.direct_hid ? "direct-hid" : "libScePad");
             jb_int(&j, "handle", (long long)g_pad.handle);
             jb_int(&j, "user", (long long)g_pad.user_id);
             jb_steps(&j, "steps", steps);
@@ -824,7 +972,7 @@ static int handle_command(int fd, char *line) {
             jbuf_t j;
             jb_begin(&j, 1);
             jb_bool(&j, "open", g_pad.open);
-            jb_str(&j, "backend", "hid");
+            jb_str(&j, "backend", g_pad.direct_hid ? "direct-hid" : "libScePad");
             jb_int(&j, "handle", (long long)g_pad.handle);
             jb_int(&j, "user", (long long)g_pad.user_id);
             jb_int(&j, "inserts", (long long)g_pad.inserts);
@@ -883,8 +1031,15 @@ static int handle_command(int fd, char *line) {
     }
 
     /* shot / shots */
-    if (!strcmp(words[0], "shot"))
+    if (!strcmp(words[0], "shot")) {
+        if (nw >= 2 && !strcmp(words[1], "latest")) return cmd_shot_latest(fd);
+        if (nw >= 4 && !strcmp(words[1], "grab")) {
+            int wait_ms = nw >= 5 ? atoi(words[4]) : 3000;
+            if (wait_ms < 100 || wait_ms > 30000) return reply_error(fd, "wait_ms out of range");
+            return cmd_shot_grab(fd, words[2], words[3], wait_ms);
+        }
         return cmd_shot(fd, nw >= 2 ? atoi(words[1]) : 0);
+    }
     if (!strcmp(words[0], "shots")) {
         capture_t caps[NEWEST_SHOTS];
         int n = 0;
@@ -956,7 +1111,7 @@ static int handle_command(int fd, char *line) {
 
 /* ── Client handler ──────────────────────────────────────────────────── */
 
-static void handle_client(int fd) {
+static bool handle_client(int fd) {
     char buf[LINE_MAX_LEN + 1];
     size_t used = 0;
     while (1) {
@@ -971,7 +1126,7 @@ static void handle_client(int fd) {
             if (nl > buf && *(nl - 1) == '\r') *(nl - 1) = '\0';
             joker_log("jokerd: <- %s", buf);
             int rc = handle_command(fd, buf);
-            if (rc == 1) return; /* quit */
+            if (rc == 1) return true; /* quit */
             /* Shift the buffer */
             size_t consumed = (size_t)(nl - buf) + 1;
             used -= consumed;
@@ -985,14 +1140,20 @@ static void handle_client(int fd) {
     }
     /* Client disconnected — release the pad to neutral */
     if (g_pad.open) pad_release();
+    return false;
 }
 
 /* ── Main ────────────────────────────────────────────────────────────── */
 
-int main(void) {
+int main(int argc, char **argv) {
+    unsigned port = JOKER_PORT;
+    if (argc > 1) {
+        unsigned long requested = strtoul(argv[1], NULL, 10);
+        if (requested > 0 && requested < 65536) port = (unsigned)requested;
+    }
     signal(SIGPIPE, SIG_IGN);
-    joker_log("jokerd: %s v%s starting on port %d", JOKER_NAME, JOKER_VERSION, JOKER_PORT);
-    notify("Joker v%s — port %d", JOKER_VERSION, JOKER_PORT);
+    joker_log("jokerd: %s v%s starting on port %u", JOKER_NAME, JOKER_VERSION, port);
+    notify("Joker v%s — port %u", JOKER_VERSION, port);
 
     /* Initialize user service early */
     sceUserServiceInitialize(NULL);
@@ -1010,7 +1171,7 @@ int main(void) {
     struct sockaddr_in addr = {0};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(JOKER_PORT);
+    addr.sin_port = htons((uint16_t)port);
     if (bind(srv, (struct sockaddr *)&addr, sizeof(addr))) {
         joker_log("jokerd: bind: %s", strerror(errno));
         close(srv);
@@ -1025,8 +1186,11 @@ int main(void) {
         int fd = accept(srv, (struct sockaddr *)&client_addr, &client_len);
         if (fd < 0) continue;
         joker_log("jokerd: client from %s", inet_ntoa(client_addr.sin_addr));
-        handle_client(fd);
+        bool stop = handle_client(fd);
         close(fd);
         joker_log("jokerd: client disconnected");
+        if (stop) break;
     }
+    close(srv);
+    return 0;
 }
