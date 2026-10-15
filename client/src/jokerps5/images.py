@@ -52,11 +52,12 @@ def _decode_jxr(data: bytes):
 
     array = imagecodecs.jpegxr_decode(data)
 
-    if np.issubdtype(array.dtype, np.floating):
-        # HDR: simple tone map - clip to [0, 1], gamma correct, scale to 8-bit.
-        array = np.clip(array, 0.0, 1.0)
-        array = np.power(array, 1.0 / 2.2)
-        array = (array * 255.0).astype(np.uint8)
+    if array.dtype != np.uint8:
+        # HDR (float or 16-bit): auto-expose to the 99.5th percentile, gamma correct, scale to 8-bit.
+        values = array.astype(np.float32)
+        white = max(float(np.percentile(values, 99.5)), 1e-6)
+        values = np.power(np.clip(values / white, 0.0, 1.0), 1.0 / 2.2)
+        array = (values * 255.0).astype(np.uint8)
 
     if array.ndim == 2:
         return Image.fromarray(array, mode="L").convert("RGB")

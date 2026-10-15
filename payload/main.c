@@ -33,6 +33,7 @@
 #include <unistd.h>
 
 #include <ps5/kernel.h>
+#include <ps5/nid.h>
 #include "util.h"
 
 /* ── Constants ───────────────────────────────────────────────────────── */
@@ -319,18 +320,36 @@ static uint64_t klog_wait_device(int log, int wait_ms, char *steps, size_t ssize
 
 /* ── Pad libraries ───────────────────────────────────────────────────── */
 
+extern int sceKernelLoadStartModule(const char *path, size_t args, const void *argp, uint32_t flags,
+                                    void *opt, int *res);
+extern int sceKernelDlsym(int handle, const char *symbol, void **addr);
+
+/* dlopen() fails inside a payload on this firmware; the kernel loader works, and
+ * exported symbols are looked up by NID (a hash of the name), not by name. */
+static int module_load(const char *path) {
+    int res = 0;
+    return sceKernelLoadStartModule(path, 0, NULL, 0, NULL, &res);
+}
+
+static void *module_sym(const char *basename, int loaded, const char *name) {
+    char nid[12];
+    void *addr = NULL;
+    if (loaded >= 0 && !sceKernelDlsym(loaded, nid_encode(name, nid), &addr) && addr) return addr;
+    uint32_t handle = 0;
+    if (kernel_dynlib_handle(getpid(), basename, &handle)) return NULL;
+    return (void *)kernel_dynlib_dlsym(getpid(), handle, name);
+}
+
 static int pad_libraries(char *steps, size_t ssize) {
     if (g_pad.libs_ready) return 0;
     elevate(steps, ssize);
 
-    void *mbus = dlopen("/system/common/lib/libSceMbus.sprx", RTLD_NOW | RTLD_GLOBAL);
-    if (!mbus) mbus = dlopen("libSceMbus.sprx", RTLD_NOW | RTLD_GLOBAL);
-    if (!mbus) {
-        const char *error = dlerror();
-        step(steps, ssize, "mbus=not-loaded:%s", error ? error : "unknown");
+    int mbus = module_load("/system/common/lib/libSceMbus.sprx");
+    if (mbus < 0) {
+        step(steps, ssize, "mbus=not-loaded:0x%08x", (uint32_t)mbus);
         return -1;
     }
-    mbus_bind = (int32_t (*)(uint64_t, int32_t))dlsym(mbus, "sceMbusBindDeviceWithUserId");
+    mbus_bind = (int32_t (*)(uint64_t, int32_t))module_sym("libSceMbus.sprx", mbus, "sceMbusBindDeviceWithUserId");
     step(steps, ssize, "mbus_bind=%s", mbus_bind ? "found" : "missing");
 
     int32_t rc = scePadInit();
@@ -456,22 +475,25 @@ static int running_app(void) {
 
 static void delete_init(void) {
     if (g_delete_ready) return;
-    void *lib = dlopen("/system/common/lib/libSceContentDelete.sprx", RTLD_NOW);
-    if (!lib) return;
-    content_delete_init = dlsym(lib, "sceContentDeleteInitialize");
-    content_delete_by_path = dlsym(lib, "sceContentDeleteByPath");
+    int lib = module_load("/system/common/lib/libSceContentDelete.sprx");
+    if (lib < 0) return;
+    content_delete_init = (int32_t (*)(content_delete_param_t *))module_sym("libSceContentDelete.sprx", lib, "sceContentDeleteInitialize");
+    content_delete_by_path = (int32_t (*)(const char *))module_sym("libSceContentDelete.sprx", lib, "sceContentDeleteByPath");
     if (content_delete_init) {
         content_delete_param_t p = {0};
         p.buffer_size = 0x4000;
-        content_delete_init(&p);
+        if (content_delete_init(&p) != 0) content_delete_by_path = NULL;
     }
     g_delete_ready = true;
 }
 
 static int delete_capture(const char *path) {
     delete_init();
-    if (!content_delete_by_path) return ENOSYS;
-    return content_delete_by_path(path);
+    if (!content_delete_by_path) return unlink(path) == 0 ? 0 : errno;
+    int rc = content_delete_by_path(path);
+    if (rc != 0 && strncmp(path, "/user/", 6) == 0) rc = content_delete_by_path(path + 5);
+    if (rc != 0 && unlink(path) == 0) rc = 0;
+    return rc;
 }
 
 /* ── Screenshot capture helpers ──────────────────────────────────────── */
@@ -654,7 +676,7 @@ static int cmd_shot_grab(int fd, const char *request, const char *folder, int wa
 
 /* ── Filesystem commands ─────────────────────────────────────────────── */
 
-static int cmd_fs_ls(int fd, const char *path) {
+static int cmd_fs_ls(int fd, const char *path, int offset, int limit) {
     if (!path_is_clean(path)) return reply_error(fd, "bad path");
     DIR *dir = opendir(path);
     if (!dir) return reply_error(fd, "opendir: %s", strerror(errno));
@@ -662,12 +684,16 @@ static int cmd_fs_ls(int fd, const char *path) {
     jb_begin(&j, 1);
     jb_key_open(&j, "entries", '[');
     struct dirent *ent;
+    int seen = 0, sent = 0, more = 0;
     while ((ent = readdir(dir))) {
         if (ent->d_name[0] == '.') continue;
+        if (seen++ < offset) continue;
+        if (sent >= limit || j.len > sizeof(j.data) - 600) { more = 1; break; }
+        sent++;
         char full[512];
         snprintf(full, sizeof(full), "%s/%s", path, ent->d_name);
         struct stat st;
-        if (stat(full, &st)) continue;
+        if (stat(full, &st)) memset(&st, 0, sizeof(st));
         jb_open(&j, '{');
         j.need_comma = 0;
         jb_str(&j, "name", ent->d_name);
@@ -678,6 +704,8 @@ static int cmd_fs_ls(int fd, const char *path) {
     }
     closedir(dir);
     jb_close(&j, ']');
+    jb_bool(&j, "more", more);
+    jb_int(&j, "next", offset + sent);
     return reply_json(fd, &j);
 }
 
@@ -1070,7 +1098,8 @@ static int handle_command(int fd, char *line) {
 
     /* fs ... */
     if (!strcmp(words[0], "fs") && nw >= 2) {
-        if (!strcmp(words[1], "ls") && nw >= 3) return cmd_fs_ls(fd, words[2]);
+        if (!strcmp(words[1], "ls") && nw >= 3)
+            return cmd_fs_ls(fd, words[2], nw >= 4 ? atoi(words[3]) : 0, nw >= 5 ? atoi(words[4]) : 150);
         if (!strcmp(words[1], "stat") && nw >= 3) return cmd_fs_stat(fd, words[2]);
         if (!strcmp(words[1], "get") && nw >= 3) return cmd_fs_get(fd, words[2]);
         if (!strcmp(words[1], "put") && nw >= 4) {
@@ -1096,6 +1125,36 @@ static int handle_command(int fd, char *line) {
             return reply_ok(fd);
         }
         if (!strcmp(words[1], "info")) return cmd_sys_info(fd);
+        if (!strcmp(words[1], "loadmod") && nw >= 3) {
+            char steps[256] = "";
+            elevate(steps, sizeof(steps));
+            int err = 0;
+            int h = sceKernelLoadStartModule(words[2], 0, NULL, 0, NULL, &err);
+            jbuf_t j;
+            jb_begin(&j, h >= 0);
+            jb_hex(&j, "handle", (uint32_t)h);
+            jb_hex(&j, "result", (uint32_t)err);
+            jb_steps(&j, "steps", steps);
+            if (h >= 0 && nw >= 4) {
+                const char *base = strrchr(words[2], '/');
+                base = base ? base + 1 : words[2];
+                uint32_t kh = 0;
+                int hrc = kernel_dynlib_handle(getpid(), base, &kh);
+                jb_hex(&j, "dynlib_rc", (uint32_t)hrc);
+                jb_hex(&j, "dynlib_handle", kh);
+                jb_bool(&j, "sym", module_sym(base, h, words[3]) != NULL);
+            }
+            return reply_json(fd, &j);
+        }
+        if (!strcmp(words[1], "dlopen") && nw >= 3) {
+            void *h = dlopen(words[2], RTLD_NOW | RTLD_GLOBAL);
+            const char *err = h ? "" : dlerror();
+            jbuf_t j;
+            jb_begin(&j, h != NULL);
+            jb_str(&j, "error", err ? err : "unknown");
+            if (h && nw >= 4) jb_bool(&j, "sym", dlsym(h, words[3]) != NULL);
+            return reply_json(fd, &j);
+        }
     }
 
     /* quit */

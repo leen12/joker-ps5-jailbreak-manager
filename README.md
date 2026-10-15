@@ -49,9 +49,12 @@ A fully open-source tool for remotely controlling a jailbroken PS5 from your PC,
 
 Start an ELF loader such as [ps5-payload-dev/elfldr](https://github.com/ps5-payload-dev/elfldr), then send `jokerd.elf` to its TCP port (normally 9021):
 
-```powershell
-payload\deploy.ps1 -HostName PS5_IP -Build
+```bash
+payloaduild.cmd           # compile + link (no PowerShell needed)
+python payload/deploy.py PS5_IP   # upload, restart, wait for hello
 ```
+
+`payload\deploy.ps1 -HostName PS5_IP -Build` does the same from PowerShell.
 
 The deploy helper defaults to Payload Manager on port 8084: it uploads a versioned ELF, gracefully stops an existing jokerd through the protocol, launches the replacement, and requires a valid `hello` response before reporting success. It never sends the payload to etaHEN DPIv2 on port 12800.
 

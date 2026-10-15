@@ -156,6 +156,12 @@ void jb_elem_str(jbuf_t *j, const char *value) {
 }
 
 void jb_end(jbuf_t *j) {
+    if (j->overflow) {
+        static const char msg[] = "{\"ok\":false,\"error\":\"reply too large\"}\n";
+        memcpy(j->data, msg, sizeof(msg));
+        j->len = sizeof(msg) - 1;
+        return;
+    }
     jb_raw(j, "}\n", 2);
     j->data[j->len] = '\0';
 }
