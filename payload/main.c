@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -110,7 +111,6 @@ typedef struct content_delete_param {
 
 static int32_t (*content_delete_init)(content_delete_param_t *param);
 static int32_t (*content_delete_by_path)(const char *path);
-static int32_t (*content_delete_term)(void);
 
 /* ── Launch param (same layout as public PS5 homebrew) ───────────────── */
 
@@ -377,7 +377,6 @@ static void delete_init(void) {
     if (!lib) return;
     content_delete_init = dlsym(lib, "sceContentDeleteInitialize");
     content_delete_by_path = dlsym(lib, "sceContentDeleteByPath");
-    content_delete_term = dlsym(lib, "sceContentDeleteTerminate");
     if (content_delete_init) {
         content_delete_param_t p = {0};
         p.buffer_size = 0x4000;
@@ -758,14 +757,16 @@ static int cmd_app_running(int fd) {
 
 /* ── Sys commands ────────────────────────────────────────────────────── */
 
+extern int sceKernelGetCpuTemperature(int *temp);
+extern int sceKernelGetSocSensorTemperature(int index, int *temp);
+
 static int cmd_sys_info(int fd) {
     jbuf_t j;
     jb_begin(&j, 1);
-    /* Firmware version from the SDK kernel helper if available */
-    uint32_t fw = 0;
-    int sdk_fd = open("/system/common/lib/libkernel.sprx", O_RDONLY);
-    if (sdk_fd >= 0) close(sdk_fd);
-    jb_hex(&j, "fw", fw);
+    jb_hex(&j, "fw", kernel_get_fw_version());
+    int temp = 0;
+    if (sceKernelGetSocSensorTemperature(0, &temp) == 0) jb_int(&j, "temp_soc", temp);
+    if (sceKernelGetCpuTemperature(&temp) == 0) jb_int(&j, "temp_cpu", temp);
     struct timespec up;
     if (clock_gettime(CLOCK_MONOTONIC, &up) == 0)
         jb_int(&j, "uptime_s", (long long)up.tv_sec);
@@ -790,7 +791,7 @@ static int handle_command(int fd, char *line) {
         jb_str(&j, "name", JOKER_NAME);
         jb_str(&j, "version", JOKER_VERSION);
         jb_int(&j, "proto", JOKER_PROTO);
-        jb_hex(&j, "fw", 0);
+        jb_hex(&j, "fw", kernel_get_fw_version());
         jb_int(&j, "pid", (long long)getpid());
         jb_str(&j, "pad", g_pad.open ? "open" : "closed");
         return reply_json(fd, &j);

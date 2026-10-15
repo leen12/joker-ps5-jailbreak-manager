@@ -47,21 +47,11 @@ void sleep_ms(unsigned ms) {
 #define JOKER_AUTHID 0x4800000000010003ull
 
 void elevate(char *steps, size_t size) {
-    struct ucred cred;
-    /* The PS5 payload SDK exposes kernel_{get,set}_ucred through ps5/kernel.h. */
-    int rc = kernel_get_ucred(getpid(), &cred);
-    step(steps, size, "get_ucred=%d", rc);
-    if (rc) return;
-    cred.cr_uid = 0;
-    cred.cr_ruid = 0;
-    cred.cr_svuid = 0;
-    cred.cr_rgid = 0;
-    cred.cr_svgid = 0;
-    cred.cr_authid = JOKER_AUTHID;
-    cred.cr_sceCaps[0] = 0xffffffffffffffffull;
-    cred.cr_sceCaps[1] = 0xffffffffffffffffull;
-    rc = kernel_set_ucred(getpid(), &cred);
-    step(steps, size, "set_ucred=%d", rc);
+    static const uint8_t all_caps[16] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                                         0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+    int authid = kernel_set_ucred_authid(getpid(), JOKER_AUTHID);
+    int caps = kernel_set_ucred_caps(getpid(), all_caps);
+    step(steps, size, "authid=%d caps=%d", authid, caps);
 }
 
 /* ── Step log ────────────────────────────────────────────────────────── */
